@@ -1,0 +1,12 @@
+# Virtual env
+.venv/
+
+# Local config/tokens
+.env
+
+# macOS
+.DS_Store
+
+# Caches / pyc
+__pycache__/
+*.pyc
