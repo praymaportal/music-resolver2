@@ -37,6 +37,12 @@ SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET")
 # если трек недоступен в регионе, лучше оставить MARKET пустым и не передавать параметр
 SPOTIFY_MARKET = os.environ.get("SPOTIFY_MARKET", "").strip()
 YTMUSIC_HEADERS_PATH = os.environ.get("YTMUSIC_HEADERS_PATH") or str(Path(__file__).resolve().parent / "ytmusic_headers.json")
+MTS_API_BASE = "https://api.music.mts.ru/web/v1"
+MTS_API_HEADERS = {
+    "X-Music-Client": "web",
+    "X-Yandex-Music-Client": "MTSMusicWebPremium/2.4.1",
+    "Content-Type": "application/json",
+}
 
 
 def _load_local_env_token() -> Optional[str]:
@@ -106,6 +112,41 @@ def _load_vk_access_token(token_path: Path) -> Optional[str]:
 _YTMUSIC_CLIENT = None
 
 
+def _proxy_url_for_service(service: Optional[str]) -> Optional[str]:
+    if not service:
+        return None
+    if service == "yandex":
+        return os.environ.get("YANDEX_PROXY_URL") or os.environ.get("MUSIC_PROXY_URL")
+    if service == "vk":
+        return os.environ.get("VK_PROXY_URL") or os.environ.get("MUSIC_PROXY_URL")
+    if service == "mts":
+        return os.environ.get("MTS_PROXY_URL") or os.environ.get("MUSIC_PROXY_URL")
+    return None
+
+
+def _get_proxies_for_url(url: str) -> Optional[Dict[str, str]]:
+    """Прокси только для Яндекс/VK/BOOM/МТС, остальные сервисы идут напрямую."""
+    proxy = _proxy_url_for_service(detect_service(url))
+    if not proxy:
+        return None
+    return {"http": proxy, "https": proxy}
+
+
+def _request(method: str, url: str, **kwargs):
+    proxies = _get_proxies_for_url(url)
+    if proxies:
+        kwargs.setdefault("proxies", proxies)
+    return requests.request(method, url, **kwargs)
+
+
+def _get(url: str, **kwargs):
+    return _request("GET", url, **kwargs)
+
+
+def _post(url: str, **kwargs):
+    return _request("POST", url, **kwargs)
+
+
 @dataclass
 class SongMeta:
     title: Optional[str]
@@ -140,18 +181,25 @@ def fetch_og_tags(url: str, dump_html: Optional[str] = None) -> Tuple[Dict[str, 
     resp = None
     for _ in range(5):
         try:
-            resp = requests.get(current_url, headers=headers, timeout=TIMEOUT, allow_redirects=False)
+            resp = _get(current_url, headers=headers, timeout=TIMEOUT, allow_redirects=False, stream=True)
         except requests.exceptions.InvalidSchema:
             break
         if resp.is_redirect or resp.is_permanent_redirect:
             location = resp.headers.get("Location")
             if not location:
+                resp.close()
+                break
+            loc_scheme = urlparse(location).scheme
+            if loc_scheme and loc_scheme not in {"http", "https"}:
+                resp.close()
                 break
             # абсолютный или относительный
             if location.startswith("http://") or location.startswith("https://"):
+                resp.close()
                 current_url = location
                 continue
             # относительный Location
+            resp.close()
             current_url = urljoin(current_url, location)
             continue
         else:
@@ -165,21 +213,30 @@ def fetch_og_tags(url: str, dump_html: Optional[str] = None) -> Tuple[Dict[str, 
     if "showcaptcha" in resp.url:
         raise RuntimeError("Страница вернула капчу (showcaptcha). Откройте ссылку в браузере, решите капчу и повторите.")
 
-    # Попробуем применить заявленную/угадываемую кодировку, чтобы не получать �
-    if resp.encoding is None:
-        resp.encoding = resp.apparent_encoding or "utf-8"
-    else:
-        resp.encoding = resp.encoding or "utf-8"
-
     final_url = resp.url
+
+    def read_head_bytes(response, max_bytes: int = 1_000_000) -> bytes:
+        buf = bytearray()
+        for chunk in response.iter_content(chunk_size=8192):
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if len(buf) >= max_bytes:
+                break
+            if b"</head" in buf.lower():
+                break
+        return bytes(buf)
+
+    head_bytes = read_head_bytes(resp)
+    resp.close()
     if dump_html:
-        Path(dump_html).write_text(resp.text, encoding="utf-8")
+        Path(dump_html).write_bytes(head_bytes)
     try:
         from bs4 import BeautifulSoup  # type: ignore
     except ImportError as exc:  # guard на случай, если зависимости не установлены
         raise RuntimeError("BeautifulSoup (bs4) не установлен. Выполните pip install -r requirements.txt") from exc
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(head_bytes, "html.parser")
     og_tags: Dict[str, str] = {}
     for tag in soup.find_all("meta"):
         prop = tag.get("property") or tag.get("name") or ""
@@ -192,18 +249,40 @@ def fetch_og_tags(url: str, dump_html: Optional[str] = None) -> Tuple[Dict[str, 
     return og_tags, final_url
 
 
+def _is_vk_host(host: str) -> bool:
+    return bool(
+        "vk." in host
+        or host in {"vk.com", "m.vk.com", "vk.ru", "m.vk.ru"}
+        or "boom.ru" in host
+    )
+
+
+def _is_youtube_host(host: str) -> bool:
+    return bool("youtube.com" in host or host == "youtu.be" or host.endswith(".youtu.be"))
+
+
+def _is_vk_music_url(url: str) -> bool:
+    host = urlparse(url).hostname or ""
+    if not _is_vk_host(host):
+        return False
+    kind, track_id, album_id, _ = parse_ids_from_url(url)
+    return bool(kind or track_id or album_id)
+
+
 def detect_service(url: str) -> Optional[str]:
     host = urlparse(url).hostname or ""
     if "yandex" in host:
         return "yandex"
-    if "vk." in host or host == "vk.com" or "boom.ru" in host:
-        return "vk"
     if "mts" in host or "onelink.me" in host:
         return "mts"
     if "shazam.com" in host:
         return "shazam"
+    if host == "music.youtube.com":
+        return "ytmusic"
     if "music.apple.com" in host:
         return "apple"
+    if _is_vk_music_url(url):
+        return "vk"
     return None
 
 
@@ -252,7 +331,7 @@ def parse_ids_from_url(url: str) -> Tuple[Optional[str], Optional[str], Optional
             return "track", segments[1], None, access_key
 
     # VK музыка / boom
-    if parsed.netloc in {"vk.com", "m.vk.com"} or "boom.ru" in parsed.netloc:
+    if parsed.netloc in {"vk.com", "m.vk.com", "vk.ru", "m.vk.ru"} or "boom.ru" in parsed.netloc:
         # форматы: audio-200..._..., audio_playlist-200..._..., share.boom.ru/track/<id>?, /music/album/<id>
         act_param = query.get("act", [])
         if act_param:
@@ -321,7 +400,7 @@ def _pick_first(data: Dict[str, str], keys) -> Optional[str]:
 def _split_artist_title(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     if not value:
         return None, None
-    for sep in (" — ", " – ", " - "):
+    for sep in (" — ", " – ", " - ", ": "):
         if sep in value:
             left, right = value.split(sep, 1)
             return left.strip() or None, right.strip() or None
@@ -356,7 +435,249 @@ def _pick_year_from_parts(parts) -> Optional[str]:
 
 
 def _normalize_text(val: Optional[str]) -> str:
-    return (val or "").strip().casefold()
+    text = (val or "").casefold()
+    try:
+        import re
+
+        text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    except Exception:
+        pass
+    return " ".join(text.split())
+
+
+def _contains_relaxed(needle: str, haystack: str, min_len: int = 4) -> bool:
+    if not needle or not haystack:
+        return False
+    if needle in haystack:
+        return True
+    if len(haystack) >= min_len and haystack in needle:
+        return True
+    return False
+
+
+def _apply_core_meta(meta: "SongMeta", data: Optional[Dict[str, str]], overwrite: bool) -> None:
+    if not data:
+        return
+    for key in ("title", "album", "artist"):
+        val = data.get(key)
+        if val and (overwrite or not getattr(meta, key)):
+            setattr(meta, key, val)
+    year = data.get("year")
+    if year and (overwrite or not meta.year):
+        meta.year = year
+
+
+def _apply_image(meta: "SongMeta", *images: Optional[str]) -> None:
+    if meta.image:
+        return
+    for img in images:
+        if img:
+            meta.image = img
+            return
+
+
+def _yandex_enrich_from_search(meta: "SongMeta") -> Optional[Dict[str, str]]:
+    """Получает метаданные из публичного поиска ЯМузыки (без токена)."""
+    base_title = meta.album if meta.kind == "album" and meta.album else meta.title or meta.album
+    if not base_title:
+        return None
+    query_parts = [base_title]
+    if meta.artist:
+        query_parts.append(meta.artist)
+    query = " ".join(p for p in query_parts if p)
+
+    search_res = _yandex_search(query) or _yandex_search(base_title)
+    if not search_res:
+        return None
+
+    tracks = (search_res.get("tracks") or {}).get("items") or []
+    albums = (search_res.get("albums") or {}).get("items") or []
+
+    title_norm = _normalize_text(base_title)
+    artist_norm = _normalize_text(meta.artist)
+    album_norm = _normalize_text(meta.album)
+
+    def score_track(t: Dict[str, str]) -> int:
+        s = 0
+        t_title = _normalize_text(t.get("title"))
+        t_artists = " ".join(_normalize_text(a.get("name")) for a in t.get("artists", []) if a.get("name"))
+        if _contains_relaxed(title_norm, t_title):
+            s += 2
+        if _contains_relaxed(artist_norm, t_artists):
+            s += 2
+        alb = (t.get("albums") or [None])[0] or {}
+        if album_norm and _contains_relaxed(album_norm, _normalize_text(alb.get("title"))):
+            s += 1
+        return s
+
+    def score_album(a: Dict[str, str]) -> int:
+        s = 0
+        a_title = _normalize_text(a.get("title"))
+        a_artists = " ".join(_normalize_text(ar.get("name")) for ar in a.get("artists", []) if ar.get("name"))
+        if _contains_relaxed(album_norm, a_title):
+            s += 2
+        if _contains_relaxed(title_norm, a_title):
+            s += 1
+        if _contains_relaxed(artist_norm, a_artists):
+            s += 2
+        return s
+
+    def pick_best(items, scorer):
+        best = None
+        best_score = 0
+        for it in items:
+            sc = scorer(it)
+            if sc > best_score:
+                best_score = sc
+                best = it
+        if not best and items:
+            best = items[0]
+        return best, best_score
+
+    if meta.kind == "album":
+        best_album, sc = pick_best(albums, score_album)
+        if not best_album and tracks:
+            # fallback: берем альбом из первого трека
+            best_track, _ = pick_best(tracks, score_track)
+            best_album = (best_track.get("albums") or [None])[0] if best_track else None
+        if not best_album:
+            return None
+        artists = ", ".join(a.get("name") for a in best_album.get("artists", []) if a.get("name"))
+        cover = _build_ym_cover(best_album.get("coverUri"))
+        album_id = best_album.get("id")
+        return {
+            "title": best_album.get("title"),
+            "album": best_album.get("title"),
+            "artist": artists or None,
+            "year": _normalize_year(best_album.get("year")),
+            "image": cover,
+            "album_id": str(album_id) if album_id else None,
+            "yandex_url": f"https://music.yandex.ru/album/{album_id}" if album_id else None,
+        }
+
+    best_track, _ = pick_best(tracks, score_track)
+    if not best_track and albums:
+        best_album, _ = pick_best(albums, score_album)
+        if best_album:
+            album_id = best_album.get("id")
+            artists = ", ".join(a.get("name") for a in best_album.get("artists", []) if a.get("name"))
+            cover = _build_ym_cover(best_album.get("coverUri"))
+            return {
+                "title": best_album.get("title"),
+                "album": best_album.get("title"),
+                "artist": artists or None,
+                "year": _normalize_year(best_album.get("year")),
+                "image": cover,
+                "album_id": str(album_id) if album_id else None,
+                "yandex_url": f"https://music.yandex.ru/album/{album_id}" if album_id else None,
+            }
+    if not best_track:
+        return None
+    artists = ", ".join(a.get("name") for a in best_track.get("artists", []) if a.get("name"))
+    alb = (best_track.get("albums") or [None])[0] or {}
+    album_id = alb.get("id")
+    cover_uri = alb.get("coverUri") or best_track.get("coverUri")
+    cover = _build_ym_cover(cover_uri)
+    track_id = best_track.get("id")
+    return {
+        "title": best_track.get("title"),
+        "album": alb.get("title"),
+        "artist": artists or None,
+        "year": _normalize_year(best_track.get("year") or alb.get("year")),
+        "image": cover,
+        "track_id": str(track_id) if track_id else None,
+        "album_id": str(album_id) if album_id else None,
+        "yandex_url": (
+            f"https://music.yandex.ru/album/{album_id}/track/{track_id}"
+            if album_id and track_id
+            else (f"https://music.yandex.ru/track/{track_id}" if track_id else None)
+        ),
+    }
+
+
+def _mts_enrich_from_ids(track_id: Optional[str], album_id: Optional[str]) -> Optional[Dict[str, str]]:
+    """Берет метаданные из MTS API по id Яндекса (если доступно)."""
+    if track_id:
+        t = _mts_api_get_track(track_id)
+        if t:
+            artists = ", ".join(a.get("name") for a in t.get("artists", []) if a.get("name"))
+            album = t.get("album") or {}
+            cover = _build_ym_cover(album.get("cover") or t.get("cover"))
+            return {
+                "title": t.get("title"),
+                "artist": artists or None,
+                "album": album.get("title"),
+                "year": _normalize_year(t.get("year") or album.get("year")),
+                "image": cover,
+            }
+    if album_id:
+        a = _mts_api_get_album(album_id)
+        if a:
+            artists = ", ".join(ar.get("name") for ar in a.get("artists", []) if ar.get("name"))
+            cover = _build_ym_cover(a.get("cover"))
+            return {
+                "title": a.get("title"),
+                "album": a.get("title"),
+                "artist": artists or None,
+                "year": _normalize_year(a.get("year")),
+                "image": cover,
+            }
+    return None
+
+
+def _extract_yandex_ids_from_meta(meta: "SongMeta") -> Tuple[Optional[str], Optional[str]]:
+    if meta.yandex_url and meta.yandex_url != "Не найдено":
+        _, t_track, t_album, _ = parse_ids_from_url(meta.yandex_url)
+        return t_track, t_album
+    return None, None
+
+
+def _mts_api_get_track(track_id: Optional[str]) -> Optional[Dict[str, str]]:
+    if not track_id or not track_id.isdigit():
+        return None
+    try:
+        resp = _get(
+            f"{MTS_API_BASE}/tracks",
+            params={"ids": track_id},
+            headers=MTS_API_HEADERS,
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        items = data.get("result") or []
+        return items[0] if items else None
+    except Exception:
+        return None
+
+
+def _mts_api_get_album(album_id: Optional[str]) -> Optional[Dict[str, str]]:
+    if not album_id or not album_id.isdigit():
+        return None
+    try:
+        resp = _get(
+            f"{MTS_API_BASE}/albums/{album_id}",
+            headers=MTS_API_HEADERS,
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("result")
+    except Exception:
+        return None
+
+
+def _mts_link_from_yandex(meta: "SongMeta") -> Optional[str]:
+    t_track, t_album = _extract_yandex_ids_from_meta(meta)
+    if meta.kind == "album":
+        if t_album and _mts_api_get_album(t_album):
+            return f"https://music.mts.ru/album/{t_album}"
+        return None
+    # track или неизвестно
+    if t_track and _mts_api_get_track(t_track):
+        return f"https://music.mts.ru/track/{t_track}"
+    if t_album and meta.kind == "album" and _mts_api_get_album(t_album):
+        return f"https://music.mts.ru/album/{t_album}"
+    return None
 
 
 def _ym_fetch_fallback(track_id: Optional[str]) -> Optional[Dict[str, str]]:
@@ -364,7 +685,7 @@ def _ym_fetch_fallback(track_id: Optional[str]) -> Optional[Dict[str, str]]:
     if not (YANDEX_TOKEN and track_id):
         return None
     try:
-        resp = requests.get(
+        resp = _get(
             f"https://api.music.yandex.net/tracks/{track_id}",
             headers={"Authorization": f"OAuth {YANDEX_TOKEN}"},
             params={"lang": "ru"},
@@ -538,7 +859,7 @@ def _spotify_get_token() -> Optional[str]:
     if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
         return None
     try:
-        resp = requests.post(
+        resp = _post(
             "https://accounts.spotify.com/api/token",
             data={"grant_type": "client_credentials"},
             auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
@@ -579,7 +900,7 @@ def _match_spotify(meta: "SongMeta") -> Optional[str]:
             params = {"q": q, "type": search_type, "limit": 10}
             if SPOTIFY_MARKET:
                 params["market"] = SPOTIFY_MARKET
-            resp = requests.get(
+            resp = _get(
                 "https://api.spotify.com/v1/search",
                 params=params,
                 headers={"Authorization": f"Bearer {token}"},
@@ -670,7 +991,7 @@ def _spotify_enrich(meta: "SongMeta") -> Optional[Dict[str, str]]:
         params = {"q": query, "type": "track", "limit": 1}
         if SPOTIFY_MARKET:
             params["market"] = SPOTIFY_MARKET
-        resp = requests.get(
+        resp = _get(
             "https://api.spotify.com/v1/search",
             params=params,
             headers={"Authorization": f"Bearer {token}"},
@@ -716,7 +1037,7 @@ def _spotify_enrich_from_url(spotify_url: str) -> Optional[Dict[str, str]]:
             endpoint = f"https://api.spotify.com/v1/albums/{sid}"
         if not endpoint:
             return None
-        resp = requests.get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        resp = _get(endpoint, headers={"Authorization": f"Bearer {token}"}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if kind == "track":
@@ -776,7 +1097,7 @@ def _apple_search_first_url(title: str, artist: str, storefront: str = "ru") -> 
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
     }
     try:
-        resp = requests.get(search_url, headers=headers, timeout=10)
+        resp = _get(search_url, headers=headers, timeout=10)
         resp.raise_for_status()
     except Exception:
         return search_url
@@ -799,7 +1120,7 @@ def _mts_search(query: str) -> Optional[Dict[str, List[Dict[str, str]]]]:
     """Возвращает searchResult из __NEXT_DATA__ на music.mts.ru/search?text=..."""
     headers = {"User-Agent": USER_AGENT}
     try:
-        resp = requests.get("https://music.mts.ru/search", params={"text": query}, headers=headers, timeout=TIMEOUT)
+        resp = _get("https://music.mts.ru/search", params={"text": query}, headers=headers, timeout=TIMEOUT)
         resp.raise_for_status()
     except Exception:
         return None
@@ -834,7 +1155,7 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
     if not search_res:
         search_res = do_search(meta.title)
     if not search_res:
-        return None
+        return _mts_link_from_yandex(meta)
 
     tracks = search_res.get("tracks") or []
     albums = search_res.get("albums") or []
@@ -843,9 +1164,9 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
         s = 0
         t_title = _normalize_text(t.get("title"))
         t_artists = " ".join(_normalize_text(a.get("name")) for a in t.get("artists", []) if a.get("name"))
-        if title_norm and title_norm in t_title:
+        if _contains_relaxed(title_norm, t_title):
             s += 2
-        if artist_norm and artist_norm in t_artists:
+        if _contains_relaxed(artist_norm, t_artists):
             s += 2
         if album_norm and _normalize_text(t.get("albumTitle")) and album_norm in _normalize_text(t.get("albumTitle")):
             s += 1
@@ -855,11 +1176,11 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
         s = 0
         a_title = _normalize_text(a.get("title"))
         a_artists = " ".join(_normalize_text(ar.get("name")) for ar in a.get("artists", []) if ar.get("name"))
-        if album_norm and album_norm in a_title:
+        if _contains_relaxed(album_norm, a_title):
             s += 2
-        if title_norm and title_norm in a_title:
+        if _contains_relaxed(title_norm, a_title):
             s += 1
-        if artist_norm and artist_norm in a_artists:
+        if _contains_relaxed(artist_norm, a_artists):
             s += 2
         return s
 
@@ -881,7 +1202,7 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
                 alb_id = t.get("albumId")
                 if alb_id:
                     return f"https://music.mts.ru/album/{alb_id}"
-        return None
+        return _mts_link_from_yandex(meta)
 
     # track
     best_track = None
@@ -895,7 +1216,7 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
         tid = best_track.get("id")
         if tid:
             return f"https://music.mts.ru/track/{tid}"
-    return None
+    return _mts_link_from_yandex(meta)
 
 
 def _yandex_search(query: str) -> Optional[Dict[str, List[Dict[str, str]]]]:
@@ -908,7 +1229,7 @@ def _yandex_search(query: str) -> Optional[Dict[str, List[Dict[str, str]]]]:
         "playlist-infinite": "true",
     }
     try:
-        resp = requests.get(
+        resp = _get(
             "https://music.yandex.ru/handlers/music-search.jsx",
             params=params,
             headers=headers,
@@ -947,9 +1268,9 @@ def _match_yandex(meta: "SongMeta") -> Optional[str]:
         s = 0
         t_title = _normalize_text(t.get("title"))
         t_artists = " ".join(_normalize_text(a.get("name")) for a in t.get("artists", []) if a.get("name"))
-        if title_norm and title_norm in t_title:
+        if _contains_relaxed(title_norm, t_title):
             s += 2
-        if artist_norm and artist_norm in t_artists:
+        if _contains_relaxed(artist_norm, t_artists):
             s += 2
         alb = (t.get("albums") or [None])[0] or {}
         if album_norm and album_norm in _normalize_text(alb.get("title")):
@@ -960,11 +1281,11 @@ def _match_yandex(meta: "SongMeta") -> Optional[str]:
         s = 0
         a_title = _normalize_text(a.get("title"))
         a_artists = " ".join(_normalize_text(ar.get("name")) for ar in a.get("artists", []) if ar.get("name"))
-        if album_norm and album_norm in a_title:
+        if _contains_relaxed(album_norm, a_title):
             s += 2
-        if title_norm and title_norm in a_title:
+        if _contains_relaxed(title_norm, a_title):
             s += 1
-        if artist_norm and artist_norm in a_artists:
+        if _contains_relaxed(artist_norm, a_artists):
             s += 2
         return s
 
@@ -1013,7 +1334,7 @@ def _yandex_album_info(album_id: Optional[str]) -> Optional[Dict[str, str]]:
     if not album_id:
         return None
     try:
-        resp = requests.get(
+        resp = _get(
             "https://music.yandex.ru/handlers/album.jsx",
             params={"album": album_id, "lang": "ru"},
             headers={"User-Agent": USER_AGENT},
@@ -1105,13 +1426,13 @@ def _vk_call(method: str, params: Dict[str, str], token: str) -> Dict[str, str]:
     if VK_API_HOST != "api.vk.com":
         verify = False
     try:
-        resp = requests.post(url, data=payload, headers=headers, timeout=15, verify=verify)
+        resp = _post(url, data=payload, headers=headers, timeout=15, verify=verify)
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException:
         # Если override хоста не сработал, попробуем api.vk.com напрямую
         if VK_API_HOST != "api.vk.com":
-            fallback = requests.post(
+            fallback = _post(
                 "https://api.vk.com/method/{0}".format(method),
                 data=payload,
                 timeout=15,
@@ -1229,6 +1550,86 @@ def _apply_cross_links(meta: "SongMeta") -> None:
             meta.yandex_url = meta.yandex_url or f"https://music.yandex.ru/album/{meta.album_id}"
 
 
+def _enrich_vk_from_search(meta: "SongMeta") -> None:
+    """Для VK/BOOM: заменяем title/artist/album результатами поиска по токенам."""
+    # 1) Яндекс поиск — основной источник, т.к. чаще совпадает по каталогу
+    y_meta = _yandex_enrich_from_search(meta)
+    core_set = False
+    if y_meta:
+        _apply_core_meta(meta, y_meta, overwrite=True)
+        core_set = True
+        if y_meta.get("yandex_url"):
+            meta.yandex_url = y_meta["yandex_url"]
+
+    # 2) MTS метаданные по id Яндекса (если доступны)
+    t_track, t_album = _extract_yandex_ids_from_meta(meta)
+    m_meta = _mts_enrich_from_ids(t_track, t_album)
+    if m_meta:
+        _apply_core_meta(meta, m_meta, overwrite=not core_set)
+        core_set = core_set or bool(m_meta)
+    if not meta.mts_url or meta.mts_url == "Не найдено":
+        mts_link = _mts_link_from_yandex(meta)
+        if mts_link:
+            meta.mts_url = mts_link
+
+    # 3) Spotify/YouTube Music как запасные источники
+    s_meta = _spotify_enrich(meta)
+    if s_meta and not core_set:
+        _apply_core_meta(meta, s_meta, overwrite=True)
+        core_set = True
+    ytm_meta = _ytmusic_enrich(meta)
+    if ytm_meta and not core_set:
+        _apply_core_meta(meta, ytm_meta, overwrite=True)
+        core_set = True
+
+    # Дополняем пустые поля из остальных источников
+    _apply_core_meta(meta, s_meta, overwrite=False)
+    _apply_core_meta(meta, ytm_meta, overwrite=False)
+
+    # Обложка: берём первую доступную из любых источников
+    _apply_image(
+        meta,
+        (y_meta or {}).get("image"),
+        (m_meta or {}).get("image"),
+        (s_meta or {}).get("image"),
+        (ytm_meta or {}).get("image"),
+    )
+
+
+def _fill_missing_image(meta: "SongMeta") -> None:
+    """Если нет обложки — берём из любого доступного API/сервиса."""
+    if meta.image:
+        return
+    candidates = []
+
+    # Яндекс: по прямой ссылке/ids
+    y_track, y_album = _extract_yandex_ids_from_meta(meta)
+    if y_track or y_album:
+        ym_info = _ym_fetch(y_track, y_album) or _yandex_album_info(y_album)
+        if ym_info and ym_info.get("image"):
+            candidates.append(ym_info.get("image"))
+        elif ym_info and ym_info.get("cover"):
+            candidates.append(ym_info.get("cover"))
+
+    # МТС: по ids (обычно совпадают с Яндекс)
+    if y_track or y_album:
+        m_meta = _mts_enrich_from_ids(y_track, y_album)
+        if m_meta and m_meta.get("image"):
+            candidates.append(m_meta.get("image"))
+
+    # Spotify / YouTube Music
+    if meta.spotify_url:
+        s_meta = _spotify_enrich_from_url(meta.spotify_url) or _spotify_enrich(meta)
+        if s_meta and s_meta.get("image"):
+            candidates.append(s_meta.get("image"))
+    if meta.ytmusic_url:
+        ytm_meta = _ytmusic_enrich(meta)
+        if ytm_meta and ytm_meta.get("image"):
+            candidates.append(ytm_meta.get("image"))
+
+    _apply_image(meta, *candidates)
+
+
 def normalize_song_meta(url: str, og_tags: Dict[str, str], resolved_url: Optional[str] = None) -> SongMeta:
     url_for_parse = resolved_url or url
     service = detect_service(url_for_parse)
@@ -1326,7 +1727,7 @@ def normalize_song_meta(url: str, og_tags: Dict[str, str], resolved_url: Optiona
 
     # Если это ссылка vk.com (не boom), сразу ставим исходный URL как vk_url без поиска
     src_host = urlparse(url).hostname or ""
-    if service == "vk" and "vk.com" in src_host:
+    if service == "vk" and ("vk.com" in src_host or "vk.ru" in src_host):
         meta.vk_url = url
 
     # Для альбомов, если название есть, а поле album отсутствует или содержит заглушку "Альбом" — ставим album = title
@@ -1363,6 +1764,12 @@ def main() -> None:
     args = parser.parse_args()
 
     service_hint = detect_service(args.url)
+    if service_hint is None and _is_vk_host(urlparse(args.url).hostname or ""):
+        print("Ссылка VK не относится к музыке. Пропускаю.")
+        return
+    if service_hint is None and _is_youtube_host(urlparse(args.url).hostname or ""):
+        print("Ссылка YouTube не относится к поддерживаемым музыкальным сервисам. Пропускаю.")
+        return
     kind_hint, track_hint, album_hint, access_hint = parse_ids_from_url(args.url)
     meta: Optional[SongMeta] = None
     resolved_url: Optional[str] = None
@@ -1458,7 +1865,7 @@ def main() -> None:
             _apply_cross_links(meta)
             # Если это ссылка vk.com (не boom), сразу ставим исходный URL как vk_url без поиска
             src_host = urlparse(args.url).hostname or ""
-            if meta.service == "vk" and "vk.com" in src_host and not meta.vk_url:
+            if meta.service == "vk" and ("vk.com" in src_host or "vk.ru" in src_host) and not meta.vk_url:
                 meta.vk_url = args.url
 
     # Для Яндекс -> попробуем найти ссылку в МТС через поиск, если нет прямой кросс-ссылки
@@ -1626,6 +2033,9 @@ def main() -> None:
                     meta.album_id = meta.album_id or t_album
             meta.mts_url = mts_link or "Не найдено"
 
+        # Перезаполняем title/album/artist по поисковым API, а не по OG
+        _enrich_vk_from_search(meta)
+
     # Spotify ссылка через поиск по названию/исполнителю (после всех обогащений)
     if not meta.spotify_url:
         spotify_link = _match_spotify(meta)
@@ -1636,6 +2046,9 @@ def main() -> None:
         yt_link = _match_ytmusic(meta)
         if yt_link:
             meta.ytmusic_url = yt_link
+
+    # Если обложки нет — попробуем получить из API других сервисов
+    _fill_missing_image(meta)
 
     # Если нет ссылок на yandex/vk/mts (все null/Не найдено) — попробуем улучшить метаданные из Spotify/YouTube Music
     links_missing = all(
