@@ -510,6 +510,66 @@ def _consonant_skeleton(val: str) -> str:
     return "".join(ch for ch in val if ch.isalnum() and ch not in vowels)
 
 
+def _token_overlap_match(a_text: str, b_text: str, min_overlap: float = 0.75) -> bool:
+    a_tokens = [t for t in a_text.split() if t]
+    b_tokens = [t for t in b_text.split() if t]
+    if len(a_tokens) < 2 or len(b_tokens) < 2:
+        return False
+    a_set = set(a_tokens)
+    b_set = set(b_tokens)
+    if not a_set or not b_set:
+        return False
+    overlap = len(a_set & b_set) / len(a_set)
+    return overlap >= min_overlap
+
+
+def _clean_title_for_match(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    text = val
+    try:
+        import re
+
+        keywords = (
+            "mix",
+            "remix",
+            "edit",
+            "version",
+            "feat",
+            "featuring",
+            "ft",
+            "radio",
+            "extended",
+            "club",
+            "instrumental",
+            "live",
+            "demo",
+            "bonus",
+            "remaster",
+            "remastered",
+            "edition",
+        )
+        kw = "|".join(keywords)
+        # удаляем скобочные уточнения с ключевыми словами
+        text = re.sub(rf"\s*[\(\[\{{][^\)\]\}}]*\b({kw})\b[^\)\]\}}]*[\)\]\}}]", "", text, flags=re.IGNORECASE)
+        # удаляем хвосты feat/ft
+        text = re.sub(r"\s+(feat\.?|featuring|ft\.?)\s+.+$", "", text, flags=re.IGNORECASE)
+        text = " ".join(text.split())
+    except Exception:
+        return val
+    if len(text) < 3:
+        return val
+    return text
+
+
+def _title_matches(title_norm: str, alt_norm: Optional[str], cand_title: str) -> bool:
+    if title_norm and _contains_relaxed(title_norm, cand_title):
+        return True
+    if alt_norm and _contains_relaxed(alt_norm, cand_title):
+        return True
+    return False
+
+
 def _contains_relaxed(needle: str, haystack: str, min_len: int = 4) -> bool:
     if not needle or not haystack:
         return False
@@ -528,17 +588,25 @@ def _is_specific_match(title_norm: str, artist_norm: str, cand_title: str, cand_
     return True
 
 
-def _spotify_artist_match(artist_norm: str, cand_artists: str) -> bool:
+def _artist_match_relaxed(artist_norm: str, cand_artists: str) -> bool:
     if not artist_norm:
         return True
     if _contains_relaxed(artist_norm, cand_artists):
+        return True
+    if _token_overlap_match(artist_norm, cand_artists):
         return True
     a_lat = _latinize_text(artist_norm)
     c_lat = _latinize_text(cand_artists)
     if a_lat and _contains_relaxed(a_lat, c_lat):
         return True
-    a_skel = _consonant_skeleton(a_lat)
-    c_skel = _consonant_skeleton(c_lat)
+    if _token_overlap_match(a_lat, c_lat):
+        return True
+    a_lat_loose = a_lat.replace("h", "")
+    c_lat_loose = c_lat.replace("h", "")
+    if a_lat_loose and _contains_relaxed(a_lat_loose, c_lat_loose):
+        return True
+    a_skel = _consonant_skeleton(a_lat_loose)
+    c_skel = _consonant_skeleton(c_lat_loose)
     if len(a_skel) >= 3 and len(c_skel) >= 3:
         if _contains_relaxed(a_skel, c_skel, min_len=3):
             return True
@@ -726,27 +794,43 @@ def _yandex_enrich_from_search(meta: "SongMeta") -> Optional[Dict[str, str]]:
         query_parts.append(meta.artist)
     query = " ".join(p for p in query_parts if p)
 
+    alt_title = _clean_title_for_match(base_title)
     search_res = _yandex_search(query) or _yandex_search(base_title)
+    if not search_res and alt_title and alt_title != base_title:
+        search_res = _yandex_search(alt_title)
     if not search_res:
         return None
 
     tracks = (search_res.get("tracks") or {}).get("items") or []
     albums = (search_res.get("albums") or {}).get("items") or []
+    if not tracks and not albums and alt_title and alt_title != base_title:
+        search_res = _yandex_search(alt_title) or search_res
+        tracks = (search_res.get("tracks") or {}).get("items") or []
+        albums = (search_res.get("albums") or {}).get("items") or []
 
     title_norm = _normalize_text(base_title)
+    alt_title_norm = _normalize_text(alt_title) if alt_title and alt_title != base_title else None
     artist_norm = _normalize_text(meta.artist)
     album_norm = _normalize_text(meta.album)
+    alt_album = _clean_title_for_match(meta.album)
+    alt_album_norm = _normalize_text(alt_album) if alt_album and alt_album != meta.album else None
 
     def score_track(t: Dict[str, str]) -> int:
         s = 0
         t_title = _normalize_text(t.get("title"))
         t_artists = " ".join(_normalize_text(a.get("name")) for a in t.get("artists", []) if a.get("name"))
-        if _contains_relaxed(title_norm, t_title):
+        if _title_matches(title_norm, alt_title_norm, t_title):
             s += 2
-        if _contains_relaxed(artist_norm, t_artists):
+        artist_match = _artist_match_relaxed(artist_norm, t_artists)
+        if artist_norm and not artist_match:
+            return 0
+        if artist_match:
             s += 2
         alb = (t.get("albums") or [None])[0] or {}
-        if album_norm and _contains_relaxed(album_norm, _normalize_text(alb.get("title"))):
+        alb_title = _normalize_text(alb.get("title"))
+        if album_norm and _contains_relaxed(album_norm, alb_title):
+            s += 1
+        elif alt_album_norm and _contains_relaxed(alt_album_norm, alb_title):
             s += 1
         return s
 
@@ -754,11 +838,14 @@ def _yandex_enrich_from_search(meta: "SongMeta") -> Optional[Dict[str, str]]:
         s = 0
         a_title = _normalize_text(a.get("title"))
         a_artists = " ".join(_normalize_text(ar.get("name")) for ar in a.get("artists", []) if ar.get("name"))
-        if _contains_relaxed(album_norm, a_title):
+        if _contains_relaxed(album_norm, a_title) or (alt_album_norm and _contains_relaxed(alt_album_norm, a_title)):
             s += 2
-        if _contains_relaxed(title_norm, a_title):
+        if _title_matches(title_norm, alt_title_norm, a_title):
             s += 1
-        if _contains_relaxed(artist_norm, a_artists):
+        artist_match = _artist_match_relaxed(artist_norm, a_artists)
+        if artist_norm and not artist_match:
+            return 0
+        if artist_match:
             s += 2
         return s
 
@@ -1048,23 +1135,51 @@ def _match_ytmusic(meta: "SongMeta") -> Optional[str]:
         query_parts.append(meta.artist)
     query = " ".join(p for p in query_parts if p)
 
+    search_filter = "albums" if is_album else "songs"
+    fallback_to_songs = False
+    alt_query = None
     try:
-        results = yt.search(query, filter="albums" if is_album else "songs", limit=5)
+        results = yt.search(query, filter=search_filter, limit=5)
     except Exception:
         return None
     if not results:
-        return None
+        alt_title = _clean_title_for_match(base_title)
+        if alt_title and alt_title != base_title:
+            alt_parts = [alt_title]
+            if meta.artist:
+                alt_parts.append(meta.artist)
+            alt_query = " ".join(p for p in alt_parts if p)
+            try:
+                results = yt.search(alt_query, filter=search_filter, limit=5)
+            except Exception:
+                return None
+        if not results and is_album:
+            # если это сингл, пробуем искать как трек
+            fallback_to_songs = True
+            try:
+                results = yt.search(query, filter="songs", limit=5)
+            except Exception:
+                return None
+            if not results and alt_query:
+                try:
+                    results = yt.search(alt_query, filter="songs", limit=5)
+                except Exception:
+                    return None
+        if not results:
+            return None
 
     title_norm = _normalize_text(base_title)
+    alt_title = _clean_title_for_match(base_title)
+    alt_title_norm = _normalize_text(alt_title) if alt_title and alt_title != base_title else None
     artist_norm = _normalize_text(meta.artist)
 
     def score(item):
         s = 0
         it_title = _normalize_text(item.get("title"))
         artists = " ".join(_normalize_text(a.get("name")) for a in item.get("artists", []) if a.get("name"))
-        title_match = _contains_relaxed(title_norm, it_title)
-        artist_match = _contains_relaxed(artist_norm, artists)
-        if not _is_specific_match(title_norm, artist_norm, it_title, artists):
+        title_match = _title_matches(title_norm, alt_title_norm, it_title)
+        artist_match = _artist_match_relaxed(artist_norm, artists)
+        if not title_match or not artist_match:
             return 0
         if title_match:
             s += 2
@@ -1082,7 +1197,7 @@ def _match_ytmusic(meta: "SongMeta") -> Optional[str]:
     if not best or best_score == 0:
         return None
 
-    if is_album:
+    if is_album and not fallback_to_songs:
         playlist_id = best.get("playlistId")
         browse_id = best.get("browseId")
         if playlist_id:
@@ -1112,14 +1227,27 @@ def _ytmusic_enrich(meta: "SongMeta") -> Optional[Dict[str, str]]:
     except Exception:
         return None
     if not results:
-        return None
+        alt_title = _clean_title_for_match(base_title)
+        if alt_title and alt_title != base_title:
+            alt_parts = [alt_title]
+            if meta.artist:
+                alt_parts.append(meta.artist)
+            alt_query = " ".join(p for p in alt_parts if p)
+            try:
+                results = yt.search(alt_query, filter="songs", limit=5)
+            except Exception:
+                return None
+        if not results:
+            return None
     title_norm = _normalize_text(base_title)
+    alt_title = _clean_title_for_match(base_title)
+    alt_title_norm = _normalize_text(alt_title) if alt_title and alt_title != base_title else None
     artist_norm = _normalize_text(meta.artist)
     it = None
     for cand in results:
         c_title = _normalize_text(cand.get("title"))
         c_artists = " ".join(_normalize_text(a.get("name")) for a in cand.get("artists", []) if a.get("name"))
-        if _is_specific_match(title_norm, artist_norm, c_title, c_artists):
+        if _title_matches(title_norm, alt_title_norm, c_title) and _artist_match_relaxed(artist_norm, c_artists):
             it = cand
             break
     if not it:
@@ -1177,6 +1305,8 @@ def _match_spotify(meta: "SongMeta") -> Optional[str]:
         return None
 
     title_norm = _normalize_text(base_title)
+    alt_title = _clean_title_for_match(base_title)
+    alt_title_norm = _normalize_text(alt_title) if alt_title and alt_title != base_title else None
     artist_norm = _normalize_text(meta.artist)
 
     query_parts = [base_title]
@@ -1207,27 +1337,34 @@ def _match_spotify(meta: "SongMeta") -> Optional[str]:
     items = do_search(query, search_album=is_album)
     if not items:
         items = do_search(base_title, search_album=is_album)
+    if not items and alt_title_norm:
+        items = do_search(alt_title, search_album=is_album)
     if not items and meta.artist:
         # пробуем запрос вида track/album:"..." artist:"..."
         kind_prefix = "album" if is_album else "track"
         items = do_search(f'{kind_prefix}:"{base_title}" artist:"{meta.artist}"', search_album=is_album)
+    if not items and meta.artist and alt_title_norm:
+        kind_prefix = "album" if is_album else "track"
+        items = do_search(f'{kind_prefix}:"{alt_title}" artist:"{meta.artist}"', search_album=is_album)
     # Если искали альбом и не нашли — попробуем по трекам и возьмём ссылку альбома
     album_from_tracks = None
     if is_album and not items:
         track_items = do_search(query, search_album=False)
         if not track_items:
             track_items = do_search(base_title, search_album=False)
+        if not track_items and alt_title_norm:
+            track_items = do_search(alt_title, search_album=False)
         if not track_items and meta.artist:
             track_items = do_search(f'track:"{base_title}" artist:"{meta.artist}"', search_album=False)
+        if not track_items and meta.artist and alt_title_norm:
+            track_items = do_search(f'track:"{alt_title}" artist:"{meta.artist}"', search_album=False)
         if track_items:
             # берем первый совпадающий трек и возвращаем ссылку на его альбом
-            title_norm = _normalize_text(base_title)
-            artist_norm = _normalize_text(meta.artist)
             best_track = None
             for t in track_items:
                 t_title = _normalize_text(t.get("name"))
                 t_artists = " ".join(_normalize_text(a.get("name")) for a in t.get("artists", []) if a.get("name"))
-                if _contains_relaxed(title_norm, t_title) and _spotify_artist_match(artist_norm, t_artists):
+                if _title_matches(title_norm, alt_title_norm, t_title) and _artist_match_relaxed(artist_norm, t_artists):
                     best_track = t
                     break
             if not best_track:
@@ -1242,8 +1379,8 @@ def _match_spotify(meta: "SongMeta") -> Optional[str]:
         s = 0
         it_title = _normalize_text(item.get("name"))
         artists = " ".join(_normalize_text(a.get("name")) for a in item.get("artists", []) if a.get("name"))
-        title_match = _contains_relaxed(title_norm, it_title)
-        artist_match = _spotify_artist_match(artist_norm, artists)
+        title_match = _title_matches(title_norm, alt_title_norm, it_title)
+        artist_match = _artist_match_relaxed(artist_norm, artists)
         if not title_match or not artist_match:
             return 0
         if title_match:
@@ -1305,14 +1442,31 @@ def _spotify_enrich(meta: "SongMeta") -> Optional[Dict[str, str]]:
         resp.raise_for_status()
         items = (resp.json().get("tracks") or {}).get("items", [])
         if not items:
+            alt_title = _clean_title_for_match(base_title)
+            if alt_title and alt_title != base_title:
+                alt_query_parts = [alt_title]
+                if meta.artist:
+                    alt_query_parts.append(meta.artist)
+                alt_query = " ".join(p for p in alt_query_parts if p)
+                resp = _get(
+                    "https://api.spotify.com/v1/search",
+                    params={"q": alt_query, "type": "track", "limit": 5},
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                items = (resp.json().get("tracks") or {}).get("items", [])
+        if not items:
             return None
         title_norm = _normalize_text(base_title)
+        alt_title = _clean_title_for_match(base_title)
+        alt_title_norm = _normalize_text(alt_title) if alt_title and alt_title != base_title else None
         artist_norm = _normalize_text(meta.artist)
         it = None
         for cand in items:
             c_title = _normalize_text(cand.get("name"))
             c_artists = " ".join(_normalize_text(a.get("name")) for a in cand.get("artists", []) if a.get("name"))
-            if _contains_relaxed(title_norm, c_title) and _spotify_artist_match(artist_norm, c_artists):
+            if _title_matches(title_norm, alt_title_norm, c_title) and _artist_match_relaxed(artist_norm, c_artists):
                 it = cand
                 break
         if not it:
@@ -1409,8 +1563,12 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
     if not meta.title:
         return None
     title_norm = _normalize_text(meta.title)
+    alt_title = _clean_title_for_match(meta.title)
+    alt_title_norm = _normalize_text(alt_title) if alt_title and alt_title != meta.title else None
     artist_norm = _normalize_text(meta.artist)
     album_norm = _normalize_text(meta.album)
+    alt_album = _clean_title_for_match(meta.album)
+    alt_album_norm = _normalize_text(alt_album) if alt_album and alt_album != meta.album else None
 
     def do_search(q: str) -> Optional[Dict[str, List[Dict[str, str]]]]:
         if not q.strip():
@@ -1421,23 +1579,34 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
     search_res = do_search(" ".join(p for p in (meta.title, meta.artist) if p))
     if not search_res:
         search_res = do_search(meta.title)
+    if not search_res and alt_title_norm:
+        search_res = do_search(alt_title)
     if not search_res:
         return _mts_link_from_yandex(meta)
 
     tracks = search_res.get("tracks") or []
     albums = search_res.get("albums") or []
+    if not tracks and not albums and alt_title_norm:
+        search_res = do_search(alt_title) or search_res
+        tracks = search_res.get("tracks") or []
+        albums = search_res.get("albums") or []
 
     def score_track(t: Dict[str, str]) -> int:
         s = 0
         t_title = _normalize_text(t.get("title"))
         t_artists = " ".join(_normalize_text(a.get("name")) for a in t.get("artists", []) if a.get("name"))
-        if not _is_specific_match(title_norm, artist_norm, t_title, t_artists):
+        if not _title_matches(title_norm, alt_title_norm, t_title):
             return 0
-        if _contains_relaxed(title_norm, t_title):
+        s += 2
+        artist_match = _artist_match_relaxed(artist_norm, t_artists)
+        if artist_norm and not artist_match:
+            return 0
+        if artist_match:
             s += 2
-        if _contains_relaxed(artist_norm, t_artists):
-            s += 2
-        if album_norm and _normalize_text(t.get("albumTitle")) and album_norm in _normalize_text(t.get("albumTitle")):
+        album_title = _normalize_text(t.get("albumTitle"))
+        if album_norm and album_norm in album_title:
+            s += 1
+        elif alt_album_norm and alt_album_norm in album_title:
             s += 1
         return s
 
@@ -1445,13 +1614,16 @@ def _match_mts(meta: "SongMeta") -> Optional[str]:
         s = 0
         a_title = _normalize_text(a.get("title"))
         a_artists = " ".join(_normalize_text(ar.get("name")) for ar in a.get("artists", []) if ar.get("name"))
-        if not _is_specific_match(album_norm or title_norm, artist_norm, a_title, a_artists):
+        if not _title_matches(album_norm or title_norm, alt_album_norm or alt_title_norm, a_title):
             return 0
-        if _contains_relaxed(album_norm, a_title):
+        if _contains_relaxed(album_norm, a_title) or (alt_album_norm and _contains_relaxed(alt_album_norm, a_title)):
             s += 2
-        if _contains_relaxed(title_norm, a_title):
+        if _title_matches(title_norm, alt_title_norm, a_title):
             s += 1
-        if _contains_relaxed(artist_norm, a_artists):
+        artist_match = _artist_match_relaxed(artist_norm, a_artists)
+        if artist_norm and not artist_match:
+            return 0
+        if artist_match:
             s += 2
         return s
 
@@ -1535,8 +1707,12 @@ def _match_yandex(meta: "SongMeta") -> Optional[str]:
     if not meta.title:
         return None
     title_norm = _normalize_text(meta.title)
+    alt_title = _clean_title_for_match(meta.title)
+    alt_title_norm = _normalize_text(alt_title) if alt_title and alt_title != meta.title else None
     artist_norm = _normalize_text(meta.artist)
     album_norm = _normalize_text(meta.album)
+    alt_album = _clean_title_for_match(meta.album)
+    alt_album_norm = _normalize_text(alt_album) if alt_album and alt_album != meta.album else None
 
     def do_search(q: str) -> Optional[Dict[str, List[Dict[str, str]]]]:
         if not q.strip():
@@ -1547,24 +1723,35 @@ def _match_yandex(meta: "SongMeta") -> Optional[str]:
     search_res = do_search(" ".join(p for p in (meta.title, meta.artist) if p))
     if not search_res:
         search_res = do_search(meta.title)
+    if not search_res and alt_title_norm:
+        search_res = do_search(alt_title)
     if not search_res:
         return None
 
     tracks = (search_res.get("tracks") or {}).get("items") or []
     albums = (search_res.get("albums") or {}).get("items") or []
+    if not tracks and not albums and alt_title_norm:
+        search_res = do_search(alt_title) or search_res
+        tracks = (search_res.get("tracks") or {}).get("items") or []
+        albums = (search_res.get("albums") or {}).get("items") or []
 
     def score_track(t: Dict[str, str]) -> int:
         s = 0
         t_title = _normalize_text(t.get("title"))
         t_artists = " ".join(_normalize_text(a.get("name")) for a in t.get("artists", []) if a.get("name"))
-        if not _is_specific_match(title_norm, artist_norm, t_title, t_artists):
+        if not _title_matches(title_norm, alt_title_norm, t_title):
             return 0
-        if _contains_relaxed(title_norm, t_title):
-            s += 2
-        if _contains_relaxed(artist_norm, t_artists):
+        s += 2
+        artist_match = _artist_match_relaxed(artist_norm, t_artists)
+        if artist_norm and not artist_match:
+            return 0
+        if artist_match:
             s += 2
         alb = (t.get("albums") or [None])[0] or {}
-        if album_norm and album_norm in _normalize_text(alb.get("title")):
+        alb_title = _normalize_text(alb.get("title"))
+        if album_norm and album_norm in alb_title:
+            s += 1
+        elif alt_album_norm and alt_album_norm in alb_title:
             s += 1
         return s
 
@@ -1572,13 +1759,16 @@ def _match_yandex(meta: "SongMeta") -> Optional[str]:
         s = 0
         a_title = _normalize_text(a.get("title"))
         a_artists = " ".join(_normalize_text(ar.get("name")) for ar in a.get("artists", []) if ar.get("name"))
-        if not _is_specific_match(album_norm or title_norm, artist_norm, a_title, a_artists):
+        if not _title_matches(album_norm or title_norm, alt_album_norm or alt_title_norm, a_title):
             return 0
-        if _contains_relaxed(album_norm, a_title):
+        if _contains_relaxed(album_norm, a_title) or (alt_album_norm and _contains_relaxed(alt_album_norm, a_title)):
             s += 2
-        if _contains_relaxed(title_norm, a_title):
+        if _title_matches(title_norm, alt_title_norm, a_title):
             s += 1
-        if _contains_relaxed(artist_norm, a_artists):
+        artist_match = _artist_match_relaxed(artist_norm, a_artists)
+        if artist_norm and not artist_match:
+            return 0
+        if artist_match:
             s += 2
         return s
 
@@ -1960,17 +2150,25 @@ def normalize_song_meta(url: str, og_tags: Dict[str, str], resolved_url: Optiona
     if artist and artist.startswith("http"):
         artist = None
 
+    artist_from_title = False
     if not artist:
-        artist_from_title, title_clean = _split_artist_title(title)
-        artist = artist_from_title or artist
+        artist_candidate, title_clean = _split_artist_title(title)
+        if artist_candidate:
+            artist = artist_candidate
+            artist_from_title = True
         title = title_clean
+    # VK часто отдаёт рекламное описание, не используем его для метаданных
+    if service == "vk" and description:
+        desc_lower = description.lower()
+        if "слушайте в vk музыке" in desc_lower or "любимые треки" in desc_lower:
+            description = None
     if description:
         structured_desc = "·" in description or "•" in description
         # Форматы ЯМузыки: "Исполнитель • Трек • 2025" или "Исполнитель · Альбом · 2025 ..."
         parts = [p.strip() for p in description.replace("·", "•").split("•") if p.strip()]
-        if not artist and parts:
+        if parts and (not artist or (service == "mts" and artist_from_title)):
             artist = parts[0]
-        if not album and len(parts) >= 2 and parts[1].lower() not in {"трек", "track", "альбом", "album"}:
+        if not album and len(parts) >= 2 and parts[1].lower() not in {"трек", "track", "альбом", "album", "сингл", "single"}:
             album = parts[1]
         artist_desc, title_desc = _split_artist_title(description)
         artist = artist or artist_desc
@@ -2057,6 +2255,9 @@ def normalize_song_meta(url: str, og_tags: Dict[str, str], resolved_url: Optiona
 
     # Для альбомов, если название есть, а поле album отсутствует или содержит заглушку "Альбом" — ставим album = title
     if meta.kind == "album" and meta.title and (not meta.album or meta.album.strip().lower() == "альбом"):
+        meta.album = meta.title
+    # Для синглов: если album = "Сингл", используем название трека
+    if meta.kind == "track" and meta.title and meta.album and meta.album.strip().lower() in {"сингл", "single"}:
         meta.album = meta.title
 
     _apply_cross_links(meta)
@@ -2219,7 +2420,10 @@ def main() -> None:
             meta.album_id = meta.album_id or a_id
             _apply_cross_links(meta)
         elif meta.mts_url and "onelink.me" in meta.mts_url:
-            meta.mts_url = "Не найдено"
+            if not (meta.title or meta.artist or meta.album):
+                meta.mts_url = "Не найдено"
+        if not meta.mts_url and "onelink.me" in meta.source_url and (meta.title or meta.artist or meta.album):
+            meta.mts_url = meta.source_url
 
     # Для Яндекс -> попробуем найти ссылку в МТС через поиск, если нет прямой кросс-ссылки
     if meta.service == "yandex" and not meta.mts_url:
@@ -2229,6 +2433,17 @@ def main() -> None:
     if meta.service == "mts" and not meta.yandex_url:
         y_link = _match_yandex(meta)
         meta.yandex_url = y_link or "Не найдено"
+    if meta.service == "mts" and meta.yandex_url and meta.yandex_url != "Не найдено":
+        k, t_id, a_id, _ = parse_ids_from_url(meta.yandex_url)
+        meta.kind = meta.kind or k
+        meta.track_id = meta.track_id or t_id
+        meta.album_id = meta.album_id or a_id
+        if not _is_mts_direct_url(meta.mts_url):
+            if meta.track_id:
+                meta.mts_url = f"https://music.mts.ru/track/{meta.track_id}"
+            elif meta.kind == "album" and meta.album_id:
+                meta.mts_url = f"https://music.mts.ru/album/{meta.album_id}"
+        _apply_cross_links(meta)
     # Для МТС: если прямую ссылку так и не получили — помечаем как не найдено
     if meta.service == "mts" and not meta.mts_url:
         meta.mts_url = "Не найдено"
@@ -2299,6 +2514,8 @@ def main() -> None:
             if not meta.vk_url:
                 vk_link = _match_vk(meta, token)
                 meta.vk_url = vk_link or meta.vk_url
+        if meta.service != "vk" and not meta.vk_url and (meta.title or meta.album):
+            meta.vk_url = "Не найдено"
 
     # Если ссылка VK и есть access_token — попробуем дополнить данные через VK API
     vk_data = None
