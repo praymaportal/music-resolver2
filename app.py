@@ -75,6 +75,7 @@ def _load_local_env_token() -> Optional[str]:
 
 
 YANDEX_TOKEN = _load_local_env_token()
+YANDEX_MUSIC_TOKEN = os.environ.get("YANDEX_MUSIC_TOKEN")
 YTMUSIC_HEADERS_JSON = os.environ.get("YTMUSIC_HEADERS_JSON")
 
 # Подхватываем Spotify креды из .env, если не заданы
@@ -118,6 +119,7 @@ def _load_vk_access_token(token_path: Path) -> Optional[str]:
 
 # Ленивая инициализация (YT Music будет настроен ниже)
 _YTMUSIC_CLIENT = None
+_YANDEX_MUSIC_CLIENTS: Dict[str, object] = {}
 
 
 def _proxy_url_for_service(service: Optional[str]) -> Optional[str]:
@@ -175,6 +177,7 @@ class SongMeta:
     mts_url: Optional[str] = None
     spotify_url: Optional[str] = None
     ytmusic_url: Optional[str] = None
+    lyrics: Optional[str] = None
 
 
 def fetch_og_tags(url: str, dump_html: Optional[str] = None) -> Tuple[Dict[str, str], str]:
@@ -784,6 +787,62 @@ def _ytmusic_enrich_from_url(url: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _extract_ytmusic_video_id(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.hostname != "music.youtube.com":
+        return None
+    if parsed.path != "/watch":
+        return None
+    params = parse_qs(parsed.query)
+    return params.get("v", [None])[0]
+
+
+def _ytmusic_fetch_lyrics(video_id: str) -> Optional[str]:
+    yt = _ytmusic_client()
+    if not yt or not video_id:
+        return None
+    try:
+        data = yt.get_watch_playlist(video_id)
+        lyrics_id = data.get("lyrics")
+        if not lyrics_id:
+            return None
+        lyr = yt.get_lyrics(lyrics_id)
+        text = (lyr or {}).get("lyrics")
+        if text:
+            text = text.strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def _ytmusic_fetch_lyrics_from_meta(meta: "SongMeta") -> Optional[str]:
+    candidates = []
+    if meta.service == "ytmusic":
+        candidates.append(meta.source_url)
+    if meta.ytmusic_url and not _is_missing_link(meta.ytmusic_url):
+        candidates.append(meta.ytmusic_url)
+    for cand in candidates:
+        vid = _extract_ytmusic_video_id(cand)
+        if not vid:
+            continue
+        lyrics = _ytmusic_fetch_lyrics(vid)
+        if lyrics:
+            return lyrics
+    if not meta.ytmusic_url or _is_missing_link(meta.ytmusic_url):
+        yt_link = _match_ytmusic(meta)
+        if yt_link:
+            meta.ytmusic_url = yt_link
+            vid = _extract_ytmusic_video_id(yt_link)
+            if vid:
+                return _ytmusic_fetch_lyrics(vid)
+    return None
+
+
 def _yandex_enrich_from_search(meta: "SongMeta") -> Optional[Dict[str, str]]:
     """Получает метаданные из публичного поиска ЯМузыки (без токена)."""
     base_title = meta.album if meta.kind == "album" and meta.album else meta.title or meta.album
@@ -991,6 +1050,24 @@ def _mts_api_get_album(album_id: Optional[str]) -> Optional[Dict[str, str]]:
         return None
 
 
+def _mts_fetch_lyrics(meta: "SongMeta") -> Optional[str]:
+    track_id = None
+    if meta.mts_url and not _is_missing_link(meta.mts_url):
+        kind, tid, _, _ = parse_ids_from_url(meta.mts_url)
+        if kind == "track" and tid:
+            track_id = tid
+    if not track_id:
+        return None
+    data = _mts_api_get_track(track_id)
+    if not data or not isinstance(data, dict):
+        return None
+    for key in ("lyrics", "lyricsText", "text", "lyric"):
+        val = data.get(key)
+        if val:
+            return str(val).strip() or None
+    return None
+
+
 def _mts_link_from_yandex(meta: "SongMeta") -> Optional[str]:
     t_track, t_album = _extract_yandex_ids_from_meta(meta)
     if meta.kind == "album":
@@ -1088,6 +1165,101 @@ def _ym_fetch(track_id: Optional[str], album_id: Optional[str], kind: Optional[s
         return None
     if album_id:
         return _ym_fetch_album(album_id)
+    return None
+
+
+# ---------- Yandex Music lyrics helpers ----------
+def _yandex_music_client(token: Optional[str]):
+    if not token:
+        return None
+    cached = _YANDEX_MUSIC_CLIENTS.get(token)
+    if cached is not None:
+        return cached
+    try:
+        from yandex_music import Client  # type: ignore
+        from yandex_music.utils.request import Request  # type: ignore
+
+        try:
+            Client._Client__notice_displayed = True  # type: ignore[attr-defined]  # noqa: SLF001
+        except Exception:
+            pass
+
+        proxy_url = _proxy_url_for_service("yandex")
+        request = Request(proxy_url=proxy_url, timeout=TIMEOUT) if proxy_url else Request(timeout=TIMEOUT)
+        client = Client(token=token, request=request)
+        _YANDEX_MUSIC_CLIENTS[token] = client
+        return client
+    except Exception:
+        return None
+
+
+def _yandex_track_id_for_lyrics(meta: "SongMeta") -> Optional[str]:
+    if meta.yandex_url and meta.yandex_url != "Не найдено":
+        kind, track_id, _, _ = parse_ids_from_url(meta.yandex_url)
+        if kind == "track" and track_id:
+            return track_id
+    if meta.service == "yandex" and meta.track_id:
+        return meta.track_id
+    # Последняя попытка: поиск по метаданным
+    y_link = _match_yandex(meta)
+    if y_link:
+        kind, track_id, _, _ = parse_ids_from_url(y_link)
+        if kind == "track" and track_id:
+            if not meta.yandex_url or meta.yandex_url == "Не найдено":
+                meta.yandex_url = y_link
+            return track_id
+    return None
+
+
+def _yandex_fetch_lyrics(meta: "SongMeta") -> Optional[str]:
+    track_id = _yandex_track_id_for_lyrics(meta)
+    if not track_id:
+        return None
+    tokens = []
+    if YANDEX_TOKEN:
+        tokens.append(YANDEX_TOKEN)
+    if YANDEX_MUSIC_TOKEN and YANDEX_MUSIC_TOKEN not in tokens:
+        tokens.append(YANDEX_MUSIC_TOKEN)
+    for token in tokens:
+        client = _yandex_music_client(token)
+        if not client:
+            continue
+        try:
+            lyrics = client.tracks_lyrics(track_id, format="TEXT")
+            if not lyrics:
+                continue
+            raw = lyrics.fetch_lyrics()
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="ignore")
+            text = raw.strip() if isinstance(raw, str) and raw else None
+            if not text:
+                continue
+            parsed = None
+            if text.startswith("[") or text.startswith("{"):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    try:
+                        import ast
+
+                        parsed = ast.literal_eval(text)
+                    except Exception:
+                        parsed = None
+            if isinstance(parsed, list):
+                lines = [str(t) for t in parsed if t is not None]
+                if lines:
+                    return "\n".join(lines).strip() or None
+            if isinstance(parsed, dict):
+                val = parsed.get("lyrics") or parsed.get("text") or parsed.get("lines")
+                if isinstance(val, list):
+                    lines = [str(t) for t in val if t is not None]
+                    if lines:
+                        return "\n".join(lines).strip() or None
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            return text or None
+        except Exception:
+            continue
     return None
 
 
@@ -1537,6 +1709,42 @@ def _spotify_enrich_from_url(spotify_url: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _spotify_fetch_lyrics(meta: "SongMeta") -> Optional[str]:
+    token = os.environ.get("SPOTIFY_LYRICS_TOKEN") or os.environ.get("SPOTIFY_WEB_TOKEN")
+    if not token:
+        return None
+    track_id = None
+    if meta.spotify_url and not _is_missing_link(meta.spotify_url):
+        kind, tid, _, _ = parse_ids_from_url(meta.spotify_url)
+        if kind == "track" and tid:
+            track_id = tid
+    if not track_id:
+        return None
+    url = f"https://spclient.wg.spotify.com/color-lyrics/v2/track/{track_id}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "App-Platform": "WebPlayer",
+        "User-Agent": USER_AGENT,
+    }
+    try:
+        resp = _get(url, headers=headers, params={"format": "json", "market": "from_token"}, timeout=TIMEOUT)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    lyrics = data.get("lyrics") if isinstance(data, dict) else None
+    if isinstance(lyrics, dict):
+        lines = lyrics.get("lines") or []
+        text_lines = [l.get("words") for l in lines if isinstance(l, dict) and l.get("words") is not None]
+        if text_lines:
+            return "\n".join(text_lines).strip() or None
+        text = lyrics.get("lyrics") or lyrics.get("text")
+        if text:
+            return str(text).strip() or None
+    return None
+
+
 def _mts_search(query: str) -> Optional[Dict[str, List[Dict[str, str]]]]:
     """Возвращает searchResult из __NEXT_DATA__ на music.mts.ru/search?text=..."""
     headers = {"User-Agent": USER_AGENT}
@@ -1966,6 +2174,44 @@ def _vk_fetch_track(track_id: str, token: str) -> Dict[str, str]:
     }
 
 
+def _vk_fetch_lyrics(meta: "SongMeta", token: str) -> Optional[str]:
+    audio_id = None
+    if meta.track_id and "_" in meta.track_id:
+        audio_id = meta.track_id
+    if not audio_id and meta.vk_url:
+        kind, track_id, _, _ = parse_ids_from_url(meta.vk_url)
+        if kind == "track" and track_id and "_" in track_id:
+            audio_id = track_id
+    if not audio_id and meta.source_url:
+        kind, track_id, _, _ = parse_ids_from_url(meta.source_url)
+        if kind == "track" and track_id and "_" in track_id:
+            audio_id = track_id
+    if not audio_id:
+        return None
+    try:
+        data = _vk_call("audio.getLyrics", {"audio_id": audio_id}, token)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    lyr = data.get("lyrics")
+    if isinstance(lyr, dict):
+        timestamps = lyr.get("timestamps") or []
+        lines = [t.get("line") for t in timestamps if isinstance(t, dict) and t.get("line") is not None]
+        if lines:
+            return "\n".join(lines).strip() or None
+        text = lyr.get("text")
+        if isinstance(text, list):
+            text_lines = [str(t) for t in text if t is not None]
+            if text_lines:
+                return "\n".join(text_lines).strip() or None
+        if text:
+            return str(text).strip() or None
+    if isinstance(lyr, str):
+        return lyr.strip() or None
+    return None
+
+
 def _vk_fetch_playlist(playlist_id: str, access_key: Optional[str], token: str) -> Dict[str, str]:
     # playlist_id в формате owner_playlist (например -2000956728_25956728)
     if "_" not in playlist_id:
@@ -2120,6 +2366,23 @@ def _fill_missing_image(meta: "SongMeta") -> None:
             candidates.append(ytm_meta.get("image"))
 
     _apply_image(meta, *candidates)
+
+
+def _fetch_lyrics(meta: "SongMeta", vk_token: Optional[str]) -> Optional[str]:
+    text = _yandex_fetch_lyrics(meta)
+    if text:
+        return text
+    if vk_token:
+        text = _vk_fetch_lyrics(meta, vk_token)
+        if text:
+            return text
+    text = _spotify_fetch_lyrics(meta)
+    if text:
+        return text
+    text = _mts_fetch_lyrics(meta)
+    if text:
+        return text
+    return _ytmusic_fetch_lyrics_from_meta(meta)
 
 
 def normalize_song_meta(url: str, og_tags: Dict[str, str], resolved_url: Optional[str] = None) -> SongMeta:
@@ -2630,6 +2893,11 @@ def main() -> None:
             meta.ytmusic_url = yt_link
         elif meta.title or meta.album:
             meta.ytmusic_url = "Не найдено"
+
+    # Лирика: пытаемся по цепочке сервисов (Яндекс -> VK -> Spotify -> МТС -> YouTube Music)
+    is_track = meta.kind == "track" or (meta.track_id and meta.kind != "album")
+    if is_track:
+        meta.lyrics = _fetch_lyrics(meta, token)
 
     # Если обложки нет — попробуем получить из API других сервисов
     _fill_missing_image(meta)
